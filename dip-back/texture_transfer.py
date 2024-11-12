@@ -2,68 +2,47 @@ import numpy as np
 from skimage import color, io
 from skimage.transform import resize
 import cv2
-
 import matplotlib.pyplot as plt
 import os
 import random
 import time
-
 from typing import List, Tuple,Union
-
 from heapq import nsmallest
-class Cell:
-    def __init__(self, i: int, j: int, cost: np.ndarray, before):
-        self.i, self.j = i, j
-        self.cost = cost 
-        self.before = before 
-    @property
-    def point(self) -> Tuple[int, int]:
-        return (self.i, self.j)
+from cell import Cell
+from grid import Grid
+def compute_patch_similarity(template: np.ndarray, overlap_mask: np.ndarray, sample_img: np.ndarray) -> np.ndarray:
+
+    # Convert to float for accurate calculations
+    template = template.astype(np.float64)
+    overlap_mask = overlap_mask.astype(np.float64)
+    sample_img = sample_img.astype(np.float64)
     
-class Grid:
-    def __init__(self, n: int, m: int):
-        self.n, self.m = n, m
-        self.d = []
-    def add(self, c: Cell) -> None:
-        self.d.append(c)
-    def get(self, i: int, j: int) -> List[Cell]:
-        return [c for c in self.d if (c.i == i) and (c.j == j)][0]
-    def get_col(self, j: int) -> List[Cell]:
-        return self.d[self.n*j:self.n*2*j]
+    # Inner function to compute SSD for each color channel
+    def compute_channel_ssd(channel: int):
+        masked_template = overlap_mask[:, :, channel] * template[:, :, channel]
+        return (
+            (masked_template ** 2).sum() 
+            - 2 * cv2.filter2D(sample_img[:, :, channel], ddepth=-1, kernel=masked_template)
+            + cv2.filter2D(sample_img[:, :, channel] ** 2, ddepth=-1, kernel=overlap_mask[:, :, channel])
+        )
 
-def _ssd_patch(T: np.ndarray, M: np.ndarray, I: np.ndarray) -> np.ndarray:
-    """
-    Performes template matching with the overlapping region, computing the cost of sampling each patch, based on the sum of squared differences (SSD).
+    # Compute SSD for each color channel
+    ssd_blue = compute_channel_ssd(0)
+    ssd_green = compute_channel_ssd(1)
+    ssd_red = compute_channel_ssd(2)
 
-    :param T: Patch in the current output image that is to be filled in
-    :param M: Mask of the overlapping region
-    :param I: Sample image
-    :return: SSD of the patch
-    """
-    T = T.astype(np.float64)
-    M = M.astype(np.float64)
-    I = I.astype(np.float64)
+    # Return the total SSD across all channels
+    return ssd_blue + ssd_green + ssd_red
+
+
+
+def select_low_cost_patch(cost_matrix: np.ndarray, tolerance: int) -> np.ndarray:
+    # Find indices of the lowest cost values within the tolerance
+    indices = np.argpartition(cost_matrix.ravel(), tolerance - 1)[:tolerance]
+    lowest_cost_positions = np.column_stack(np.unravel_index(indices, cost_matrix.shape))
     
-    def _ssd(ch: int):
-        return ((M[:,:,ch]*T[:,:,ch])**2).sum() - 2 * cv2.filter2D(I[:,:,ch], ddepth=-1, kernel = M[:,:,ch]*T[:,:,ch]) + cv2.filter2D(I[:,:,ch] ** 2, ddepth=-1, kernel=M[:,:,ch])
-
-    ssd_b = _ssd(0)
-    ssd_g = _ssd(1)
-    ssd_r = _ssd(2)
-
-    return ssd_b + ssd_g + ssd_r
-
-def _choose_sample(cost: np.ndarray, tol: int) -> np.ndarray:
-    """
-    Selects a randomly sampled patch with low cost.
-
-    :param cost: Cost matrix
-    :param tol: Tolerance
-    :return: Patch with min cost
-    """
-    idx = np.argpartition(cost.ravel(), tol-1)[:tol]
-    lowest_cost = np.column_stack(np.unravel_index(idx, cost.shape))
-    return random.choice(lowest_cost)
+    # Randomly choose one of the patches with the lowest cost
+    return random.choice(lowest_cost_positions)
 def customized_cut(err_patch: np.ndarray) -> Union[np.ndarray, List]:
     h, w = err_patch.shape[:2]
     grid = Grid(h, w)
@@ -112,15 +91,13 @@ def _multiply_on_last_axis(matrix_a: np.ndarray, matrix_b: np.ndarray) -> np.nda
     return matrix_a
 
 def texture_transfer(input_image_file, target_image_file):
-    # sample_img = cv2.cvtColor(cv2.imread(input_image_file), cv2.COLOR_BGR2RGB)
-    # sample_trg = cv2.cvtColor(cv2.imread(target_image_file), cv2.COLOR_BGR2RGB)
+   
     input_image = io.imread(input_image_file)
     target_image = io.imread(target_image_file)
-    target_w, target_h = target_image.shape[:2]
-    output = np.zeros((target_w, target_h, 3))
-  
+    target_h = target_image.shape[1]  # Width
+    target_w = target_image.shape[0]  # Height
 
-    print(input_image)
+    output = np.zeros((target_w, target_h, 3)) #This creates empty array for output image
     patch_size = 20
     overlap = 12
     tol = 50
@@ -153,19 +130,19 @@ def texture_transfer(input_image_file, target_image_file):
                     mask[:, :overlap, :] = 1
                     mask[:overlap, :, :] = 1
                 
-                ssd_overlap = _ssd_patch(template, mask, input_image)
+                ssd_overlap = compute_patch_similarity(template, mask, input_image)
                 ssd_overlap = ssd_overlap[half:-half, half:-half]  
                 
-                ssd_target = _ssd_patch(_target, np.ones((patch_size, patch_size, 3)), input_image)
+                ssd_target = compute_patch_similarity(_target, np.ones((patch_size, patch_size, 3)), input_image)
                 ssd_target = ssd_target[half:-half, half:-half] 
                
                 ssd_prev = 0
                 if n > 0:  # n is number of iteration
-                    ssd_prev = _ssd_patch(synthesized, np.ones((patch_size, patch_size, 3)), input_image)
+                    ssd_prev = compute_patch_similarity(synthesized, np.ones((patch_size, patch_size, 3)), input_image)
                     ssd_prev = ssd_prev[half:-half, half:-half] 
                 
                 ssd = (ssd_overlap + ssd_prev) * alpha + ssd_target * (1 - alpha)
-                x, y = _choose_sample(ssd, tol)
+                x, y = select_low_cost_patch(ssd, tol)
 
                 patch = input_image[x:x+patch_size, y:y+patch_size, :].copy()
                 mask1 = np.zeros((patch_size, patch_size))
